@@ -11,6 +11,7 @@
 - 无状态：不写文件，不保存跨重启的数据，流量累加由 hub 负责
 - token 走 `Authorization` 头，不进反向代理的 access log
 - 非回环地址拒绝明文 `ws://`
+- 可选只上报模式：由本机配置，忽略主控下发的所有任务
 
 ## 安装
 
@@ -23,6 +24,14 @@ curl -fsSL https://your-hub/install.sh | sh -s -- --server https://your-hub --to
 安装脚本识别 systemd 与 OpenRC，二进制装到 `/opt/monitor/monitor-agent`，token 写入
 `/opt/monitor/agent.env`（0600）——和 hub 同一个目录，那台机器上只有这一处要看。
 
+安装时会询问运行模式：只上报本机指标，或允许 hub 下发 TCP 探测任务。也可在命令末尾加
+`--report-only`（只上报）或 `--allow-probes`（常规探测），跳过询问，适合批量安装。
+重装默认保留已有模式；首次安装默认常规探测，以兼容原有行为。没有终端时直接使用该默认值。
+
+```bash
+curl -fsSL https://your-hub/install.sh | sh -s -- --server https://your-hub --token <token> --report-only
+```
+
 ## 运行
 
 ```bash
@@ -34,7 +43,18 @@ monitor-agent --server https://your-hub --token <token>
 | `--server` | 必填 | hub 地址，也可用 `MONITOR_SERVER` |
 | `--token` | 必填 | 节点 token，也可用 `MONITOR_TOKEN` |
 | `--interval` | 1 | 上报间隔（秒），1–3600 |
+| `--report-only` | 关闭 | 忽略 hub 下发的所有应用消息；也可设 `MONITOR_REPORT_ONLY=true`，仅接受 `true` / `false` |
 | `--iface` | 空 | 流量统计的网卡，逗号分隔，也可用 `MONITOR_IFACE`；见下 |
+
+### 只上报模式
+
+开启后仍上报主机信息和指标、响应 WebSocket 心跳，但在解析 JSON 前丢弃 hub 的应用消息，
+不执行 TCP 探测，也不上报探测结果。开关只由本机启动参数或环境变量控制，hub 无法通过下发消息关闭它。
+`--report-only` 优先于环境变量；修改本机配置后需重启 agent。
+
+这是拒绝远程任务的限制，不是“绝对安全”的保证：连接仍需处理 TLS / WebSocket 协议，hub 仍会收到
+上报的数据。安装脚本和二进制目前由 hub 提供，安装或升级时必须信任来源；该模式不能保护从已被攻破的
+hub 下载并运行的程序。安装脚本启用此模式需要包含 `--report-only` 支持的 agent 版本。
 
 ### 统计哪些网卡的流量
 

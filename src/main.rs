@@ -28,6 +28,8 @@ struct Args {
     /// Permits plain HTTP to a hub reached at ip:port with no TLS in front.
     /// Off by default: the token would otherwise travel in the clear.
     insecure: bool,
+    /// Local policy: discard hub application messages before parsing them.
+    report_only: bool,
 }
 
 fn usage() -> ! {
@@ -38,6 +40,7 @@ fn usage() -> ! {
            --server <url>       Hub base URL, e.g. https://hub.example.com\n  \
            --token <token>      Node token from the hub panel\n  \
            --interval <secs>    Report interval (default 1)\n  \
+           --report-only        Only report metrics; ignore all hub tasks\n  \
            --iface <list>       Count traffic on these interfaces alone, e.g.\n                       \
                                 eth1,pppoe-wan. `-name` removes an interface\n                       \
                                 from what would be counted. Full names only.\n  \
@@ -51,6 +54,7 @@ fn usage() -> ! {
 
 fn parse_args() -> Result<Args> {
     let (mut server, mut token, mut interval, mut iface, mut insecure) = (None, None, 1u64, None, false);
+    let mut report_only = false;
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         let mut value = || it.next().unwrap_or_else(|| usage());
@@ -60,6 +64,7 @@ fn parse_args() -> Result<Args> {
             "--interval" => interval = value().parse().unwrap_or_else(|_| usage()),
             "--iface" => iface = Some(value()),
             "--insecure" => insecure = true,
+            "--report-only" => report_only = true,
             "-h" | "--help" => usage(),
             other => bail!("unknown argument: {other}"),
         }
@@ -68,7 +73,13 @@ fn parse_args() -> Result<Args> {
     let token = token.or_else(|| std::env::var("MONITOR_TOKEN").ok()).unwrap_or_else(|| usage());
     let iface = iface.or_else(|| std::env::var("MONITOR_IFACE").ok()).unwrap_or_default();
     let ifaces = collect::Ifaces::parse(&iface).map_err(anyhow::Error::msg)?;
-    Ok(Args { server, token, interval: interval.clamp(1, 3600), ifaces, insecure })
+    let report_only = report_only
+        || match std::env::var("MONITOR_REPORT_ONLY") {
+            Ok(value) => value.parse::<bool>().context("MONITOR_REPORT_ONLY must be true or false")?,
+            Err(std::env::VarError::NotPresent) => false,
+            Err(e) => return Err(e).context("MONITOR_REPORT_ONLY must be true or false"),
+        };
+    Ok(Args { server, token, interval: interval.clamp(1, 3600), ifaces, insecure, report_only })
 }
 
 /// `https://host/path` -> `wss://host/path/api/agent/ws`. The token travels in
@@ -178,6 +189,9 @@ fn remaining(last_frame: Instant) -> Duration {
 async fn main() -> Result<()> {
     let args = parse_args()?;
     let url = ws_url(&args.server, args.insecure)?;
+    if args.report_only {
+        eprintln!("report-only mode: ignoring all hub tasks");
+    }
     // Reported once at startup. install.sh hardens this unit with
     // ProtectHome=yes, which mounts a tmpfs over /home; where /home is its own
     // filesystem the totals then omit it. The unit file owns that decision, but
@@ -202,7 +216,9 @@ async fn main() -> Result<()> {
         // that ran. `None` means never connected, which keeps the backoff
         // doubling.
         let mut connected = None;
-        if let Err(e) = session(&url, &args.token, &mut collector, args.interval, &mut connected).await {
+        if let Err(e) =
+            session(&url, &args.token, &mut collector, args.interval, args.report_only, &mut connected).await
+        {
             eprintln!("session ended: {e:#}");
         }
         wait = reconnect_wait(wait, connected.map_or(Duration::ZERO, |t: Instant| t.elapsed()));
@@ -273,6 +289,7 @@ async fn session(
     token: &str,
     collector: &mut Collector,
     interval: u64,
+    report_only: bool,
     connected: &mut Option<Instant>,
 ) -> Result<()> {
     let mut request = url.into_client_request()?;
@@ -338,6 +355,10 @@ async fn session(
                 // heartbeat ping -- the only one on an otherwise idle link.
                 last_frame = Instant::now();
                 match incoming {
+                    // Enforce the local policy before parsing any RPC, so it
+                    // also covers future methods. WebSocket control frames
+                    // still keep reporting and the heartbeat working.
+                    Some(Ok(Message::Text(_) | Message::Binary(_))) if report_only => {}
                     Some(Ok(Message::Text(text))) => {
                         if let Ok(rpc) = serde_json::from_str::<Rpc>(&text) {
                             if rpc.method == "ping.tasks" {
@@ -546,6 +567,90 @@ async fn handshake(addresses: impl Iterator<Item = std::net::SocketAddr>) -> i32
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Exercise the actual WebSocket receive loop: a compromised hub keeps
+    /// pushing tasks and tries to change the local policy while reports flow.
+    async fn check_session_policy(report_only: bool) {
+        let hub = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/api/agent/ws", hub.local_addr().unwrap());
+        let mut collector = Collector::new(collect::Ifaces::parse("").unwrap());
+        let mut connected = None;
+        let agent = session(&url, "test-token", &mut collector, 1, report_only, &mut connected);
+        let server = async {
+            let (stream, _) = hub.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let tasks = serde_json::json!([{
+                "id": 1, "target": target.local_addr().unwrap().to_string(), "interval": 5
+            }]);
+            ws.send(notify("ping.tasks", tasks.clone())).await.unwrap();
+            ws.send(Message::Ping(b"heartbeat".to_vec().into())).await.unwrap();
+            let (mut hello, mut reports, mut pong, mut probes, mut results) = (false, 0, false, 0, 0);
+            loop {
+                tokio::select! {
+                    accepted = target.accept() => {
+                        accepted.unwrap();
+                        assert!(!report_only, "a report-only agent must never connect to a hub-chosen target");
+                        probes += 1;
+                    }
+                    message = ws.next() => match message.unwrap().unwrap() {
+                        Message::Text(text) => {
+                            let rpc: Rpc = serde_json::from_str(&text).unwrap();
+                            match rpc.method.as_str() {
+                                "hello" => hello = true,
+                                "report" => {
+                                    reports += 1;
+                                    if reports == 1 {
+                                        ws.send(notify("config.set", serde_json::json!({"report_only": false})))
+                                            .await.unwrap();
+                                        ws.send(notify("ping.tasks", tasks.clone())).await.unwrap();
+                                        // Alternate encodings and invalid JSON cannot enable tasks either.
+                                        let binary = notify("ping.tasks", tasks.clone()).into_data();
+                                        ws.send(Message::Binary(binary)).await.unwrap();
+                                        ws.send(Message::Text("not json".into())).await.unwrap();
+                                    }
+                                }
+                                "ping.result" => {
+                                    assert!(!report_only, "a report-only agent must not send probe results");
+                                    assert_eq!(rpc.params["task_id"], 1);
+                                    assert!(rpc.params["latency_ms"].as_i64().unwrap() >= 0);
+                                    results += 1;
+                                }
+                                other => panic!("unexpected notification: {other}"),
+                            }
+                        }
+                        Message::Pong(data) => {
+                            assert_eq!(&data[..], b"heartbeat");
+                            pong = true;
+                        }
+                        other => panic!("unexpected frame: {other:?}"),
+                    }
+                }
+                if hello && reports >= 2 && pong && (report_only || (probes > 0 && results > 0)) {
+                    break;
+                }
+            }
+            ws.close(None).await.unwrap();
+        };
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let (_, outcome) = tokio::join!(server, agent);
+            // Closing a session also tears down any ordinary probe loops.
+            let _ = outcome;
+        })
+        .await
+        .expect("reports, heartbeat and session shutdown must keep working");
+        assert!(connected.is_some());
+    }
+
+    #[tokio::test]
+    async fn report_only_ignores_hub_tasks_but_keeps_reporting_and_heartbeats() {
+        check_session_policy(true).await;
+    }
+
+    #[tokio::test]
+    async fn ordinary_mode_still_runs_hub_assigned_probes() {
+        check_session_policy(false).await;
+    }
 
     #[test]
     fn a_hub_restart_costs_a_second_while_an_unreachable_one_still_backs_off() {
