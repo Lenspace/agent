@@ -1551,13 +1551,17 @@ mod crosscheck {
             assert!(drift < TOLERANCE, "{what}: ours={ours} theirs={theirs} drift={drift}");
         };
 
-        // free(1) row "Mem:": its used column is total - available, which is
-        // what MemAvailable reports.
+        // Modern free(1) defines used as total - available. Older procps (e.g.
+        // 3.3.17) instead subtract free + buffers/cache in the used column, but
+        // already expose MemAvailable in the last column. Compare the same
+        // definition on both versions without changing the agent's metric.
         let free = tool("free", &["-b"]);
         let mut row = free.lines().nth(1).expect("free prints a Mem: row").split_whitespace().skip(1);
         let parse = |v: Option<&str>| v.expect("free column").parse::<u64>().expect("a byte count");
-        assert_eq!(m.mem_total, parse(row.next()), "MemTotal is not free's total");
-        close(m.mem_used, parse(row.next()), "memory");
+        let total = parse(row.next());
+        assert_eq!(m.mem_total, total, "MemTotal is not free's total");
+        let available = parse(row.nth(4));
+        close(m.mem_used, total - available, "memory");
 
         // free(1) row "Swap:": total, used, free. The tolerance is far tighter
         // than for memory because the miscount it catches -- subtracting
